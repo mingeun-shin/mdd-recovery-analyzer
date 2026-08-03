@@ -1,26 +1,123 @@
 @import "tailwindcss";
 
+/* ---- Design tokens (ported from the Apple-style design system) ----
+   Plain (non-inline) @theme with literal values: Tailwind both generates
+   the utilities (bg-primary, text-ink, rounded-pill, ...) AND emits a real
+   `:root { --color-primary: ... }` custom property, so `var(--color-primary)`
+   also resolves correctly wherever it's used directly in inline styles. */
+@theme {
+  --color-primary: #0066cc;
+  --color-primary-focus: #0071e3;
+  --color-primary-on-dark: #2997ff;
+
+  --color-ink: #1d1d1f;
+  --color-body-on-dark: #ffffff;
+  --color-body-muted: #cccccc;
+  --color-ink-muted-80: #333333;
+  --color-ink-muted-48: #7a7a7a;
+  --color-on-primary: #ffffff;
+
+  --color-canvas: #ffffff;
+  --color-parchment: #f5f5f7;
+  --color-pearl: #fafafc;
+  --color-surface-black: #000000;
+
+  --color-hairline: #e0e0e0;
+  --color-divider-soft: #f0f0f0;
+
+  /* Semantic: drawdown/recovery (kept distinct from the neutral Apple palette) */
+  --color-negative: #bf3a2c;
+  --color-positive: #1a7f4b;
+  --color-negative-soft: rgba(191, 58, 44, 0.1);
+  --color-positive-soft: rgba(26, 127, 75, 0.1);
+
+  --radius-none: 0px;
+  --radius-sm: 8px;
+  --radius-md: 11px;
+  --radius-lg: 18px;
+  --radius-pill: 9999px;
+}
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Spacing */
+  --space-xxs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 17px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-xxl: 48px;
+  --space-section: 80px;
+
+  /* Elevation */
+  --shadow-product: rgba(0, 0, 0, 0.22) 3px 5px 30px 0;
+  --backdrop-frosted: saturate(180%) blur(20px);
+
+  --font-display: var(--font-inter), system-ui, -apple-system, sans-serif;
+  --font-text: var(--font-inter), system-ui, -apple-system, sans-serif;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+/* Tailwind v4 layer order is theme, base, components, utilities — utilities
+   always win. Anything written outside a @layer block is *unlayered* and
+   beats ALL of those regardless of specificity, which previously made this
+   plain `a { color }` rule override `.text-white` on blue buttons (blue
+   text on a blue background). Keeping these in @layer base/components keeps
+   utility classes able to override them as expected. */
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  body {
+    margin: 0;
+    font-family: var(--font-text);
+    font-size: 17px;
+    font-weight: 400;
+    line-height: 1.47;
+    letter-spacing: -0.374px;
+    color: var(--color-ink);
+    background: var(--color-canvas);
+  }
+
+  a {
+    color: var(--color-primary);
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+
+  *:focus-visible {
+    outline: 2px solid var(--color-primary-focus);
+    outline-offset: 2px;
+  }
+
+  input[type="date"] {
+    font-family: var(--font-text);
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* ---- Typography roles ---- */
+@layer components {
+  .type-hero-display { font-family: var(--font-display); font-size: 56px; font-weight: 600; line-height: 1.07; letter-spacing: -0.28px; }
+  .type-display-lg { font-family: var(--font-display); font-size: 40px; font-weight: 600; line-height: 1.1; letter-spacing: 0; }
+  .type-display-md { font-family: var(--font-text); font-size: 34px; font-weight: 600; line-height: 1.2; letter-spacing: -0.374px; }
+  .type-lead { font-family: var(--font-display); font-size: 28px; font-weight: 400; line-height: 1.14; letter-spacing: 0.196px; }
+  .type-tagline { font-family: var(--font-display); font-size: 21px; font-weight: 600; line-height: 1.19; letter-spacing: 0.231px; }
+  .type-body-strong { font-family: var(--font-text); font-size: 17px; font-weight: 600; line-height: 1.24; letter-spacing: -0.374px; }
+  .type-body { font-family: var(--font-text); font-size: 17px; font-weight: 400; line-height: 1.47; letter-spacing: -0.374px; }
+  .type-caption { font-family: var(--font-text); font-size: 14px; font-weight: 400; line-height: 1.43; letter-spacing: -0.224px; }
+  .type-caption-strong { font-family: var(--font-text); font-size: 14px; font-weight: 600; line-height: 1.29; letter-spacing: -0.224px; }
+  .type-fine-print { font-family: var(--font-text); font-size: 12px; font-weight: 400; line-height: 1.3; letter-spacing: -0.12px; }
+  .type-micro-legal { font-family: var(--font-text); font-size: 10px; font-weight: 400; line-height: 1.3; letter-spacing: -0.08px; }
+  .type-nav-link { font-family: var(--font-text); font-size: 12px; font-weight: 400; line-height: 1; letter-spacing: -0.12px; }
+}
+
+@keyframes dd-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+@keyframes dd-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
