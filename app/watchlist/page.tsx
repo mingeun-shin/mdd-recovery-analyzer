@@ -12,6 +12,16 @@ import type { QuoteSeries } from "@/lib/quotes";
 const NEG = "#bf3a2c";
 const POS = "#1a7f4b";
 
+// Twelve Data's free tier allows 8 req/min. A cold cache (see the TTL cache
+// in lib/quotes.ts) plus a watchlist bigger than that would otherwise fire
+// every row's request at once and start 429ing past the 6th or 7th ticker.
+const BATCH_SIZE = 6;
+const BATCH_DELAY_MS = 60_000;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 type RowState =
   | { status: "loading" }
   | { status: "error"; message: string }
@@ -28,33 +38,48 @@ export default function WatchlistPage() {
   const [rows, setRows] = useState<Record<string, RowState>>({});
 
   useEffect(() => {
-    entries.forEach((e) => {
-      if (rows[e.ticker]) return;
-      setRows((prev) => ({ ...prev, [e.ticker]: { status: "loading" } }));
-      fetch(`/api/series?ticker=${encodeURIComponent(e.ticker)}`)
-        .then(async (res) => {
-          const body = await res.json();
-          if (!res.ok) throw new Error(body.error || "Failed to load.");
-          return body as QuoteSeries;
-        })
-        .then((data) => {
-          const series: SeriesPoint[] = data.points.map((p) => ({ ms: Date.parse(p.t), p: p.c }));
-          const A = analyze(series, 10);
-          setRows((prev) => ({
-            ...prev,
-            [e.ticker]: {
-              status: "ready",
-              currency: data.currency,
-              last: series[series.length - 1].p,
-              currentDD: A.currentDD,
-              runningPeak: A.runningPeak,
-            },
-          }));
-        })
-        .catch((err: Error) => {
-          setRows((prev) => ({ ...prev, [e.ticker]: { status: "error", message: err.message } }));
-        });
-    });
+    const pending = entries.map((e) => e.ticker).filter((t) => !rows[t]);
+    if (!pending.length) return;
+
+    let cancelled = false;
+
+    async function loadOne(t: string) {
+      setRows((prev) => ({ ...prev, [t]: { status: "loading" } }));
+      try {
+        const res = await fetch(`/api/series?ticker=${encodeURIComponent(t)}`);
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.error || "Failed to load.");
+        const data = body as QuoteSeries;
+        const series: SeriesPoint[] = data.points.map((p) => ({ ms: Date.parse(p.t), p: p.c }));
+        const A = analyze(series, 10);
+        if (cancelled) return;
+        setRows((prev) => ({
+          ...prev,
+          [t]: {
+            status: "ready",
+            currency: data.currency,
+            last: series[series.length - 1].p,
+            currentDD: A.currentDD,
+            runningPeak: A.runningPeak,
+          },
+        }));
+      } catch (err) {
+        if (cancelled) return;
+        setRows((prev) => ({ ...prev, [t]: { status: "error", message: (err as Error).message } }));
+      }
+    }
+
+    (async () => {
+      for (let i = 0; i < pending.length; i += BATCH_SIZE) {
+        if (cancelled) return;
+        if (i > 0) await sleep(BATCH_DELAY_MS);
+        await Promise.all(pending.slice(i, i + BATCH_SIZE).map(loadOne));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entries]);
 
