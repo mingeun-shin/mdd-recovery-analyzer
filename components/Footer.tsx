@@ -1,7 +1,7 @@
 export function Footer() {
   return (
     <footer className="bg-parchment border-t border-hairline mt-auto">
-      <div className="max-w-[1440px] mx-auto px-6 py-12">
+      <div className="max-w-[1440px] mx-auto pad-safe-x pt-12 pad-safe-bottom">
         <p className="type-fine-print text-ink-muted-80 max-w-[70ch] text-pretty">
           Maximum drawdown is the largest peak-to-trough decline in closing price within the
           selected range. Recovery is the first close at or above the prior peak. Historical
