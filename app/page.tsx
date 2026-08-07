@@ -1,6 +1,7 @@
 import { GlobalNav } from "@/components/GlobalNav";
 import { Footer } from "@/components/Footer";
 import { SearchForm } from "@/components/SearchForm";
+import { InstallPrompt } from "@/components/InstallPrompt";
 
 export default function Home() {
   return (
@@ -21,6 +22,8 @@ export default function Home() {
           <p className="type-caption text-ink-muted-48 mt-8">
             Analysis runs on daily closing prices, adjusted for splits and dividends.
           </p>
+
+          <InstallPrompt />
         </div>
       </main>
       <Footer />
