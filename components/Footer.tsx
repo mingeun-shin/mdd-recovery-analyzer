@@ -9,7 +9,7 @@ export function Footer() {
           predictive claim.
         </p>
         <p className="type-micro-legal text-ink-muted-48 mt-6">
-          Price data via Yahoo Finance, may be delayed. Not investment advice.
+          Price data via Twelve Data, may be delayed. Not investment advice.
         </p>
       </div>
     </footer>
