@@ -12,8 +12,19 @@ import { createClient } from "@supabase/supabase-js";
  * The "server-only" import above turns an accidental client-side import into
  * a build error rather than a leaked secret key.
  */
-export const supabaseAdmin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!,
-  { auth: { persistSession: false, autoRefreshToken: false } }
-);
+const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const secretKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+// Fail at startup rather than per-request. Cache reads fall back to Twelve
+// Data on error, so a missing env var would otherwise look exactly like
+// everything working — until the rate limit runs out days later.
+if (!url || !secretKey) {
+  throw new Error(
+    "Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. " +
+      "Set both in .env.local locally, and in the Vercel project settings for deploys."
+  );
+}
+
+export const supabaseAdmin = createClient(url, secretKey, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
