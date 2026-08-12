@@ -1,4 +1,5 @@
 import { TICKER_RE } from "./ticker";
+import { supabaseAdmin } from "./supabase/admin";
 
 export type QuotePoint = { t: string; c: number };
 
@@ -28,9 +29,15 @@ type TwelveDataResponse = {
 
 // Daily closes only change once a day, so there's no reason to spend the
 // free tier's 8 req/min budget re-fetching the same ticker on every page
-// view. Cached per server instance; in-flight de-dupe collapses concurrent
-// requests for the same ticker (e.g. a watchlist rendering several rows)
-// into a single upstream call.
+// view. Two layers sit in front of Twelve Data:
+//
+//   L1  in-process Map — free, but dies with each serverless instance
+//   L2  public.quote_series in Supabase — shared by every instance, so a
+//       cold start costs a DB read rather than an upstream request
+//
+// In-flight de-dupe collapses concurrent requests for the same ticker (e.g.
+// a watchlist rendering several rows) into a single L2 lookup and, at most,
+// a single upstream call.
 const SERIES_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const seriesCache = new Map<string, { data: QuoteSeries; expiresAt: number }>();
 const seriesInflight = new Map<string, Promise<QuoteSeries>>();
@@ -52,7 +59,7 @@ export async function fetchSeries(rawTicker: string): Promise<QuoteSeries> {
   const pending = seriesInflight.get(ticker);
   if (pending) return pending;
 
-  const promise = fetchSeriesUncached(ticker)
+  const promise = loadSeries(ticker)
     .then((data) => {
       seriesCache.set(ticker, { data, expiresAt: Date.now() + SERIES_CACHE_TTL_MS });
       return data;
@@ -60,6 +67,85 @@ export async function fetchSeries(rawTicker: string): Promise<QuoteSeries> {
     .finally(() => seriesInflight.delete(ticker));
   seriesInflight.set(ticker, promise);
   return promise;
+}
+
+/** L2, then upstream. */
+async function loadSeries(ticker: string): Promise<QuoteSeries> {
+  const shared = await readSharedCache(ticker);
+  if (shared) return shared;
+
+  const fresh = await fetchSeriesUncached(ticker);
+  // Deliberately not awaited: the caller already has its data, and a slow
+  // write shouldn't sit on the response. Errors are swallowed inside.
+  void writeSharedCache(fresh);
+  return fresh;
+}
+
+type QuoteSeriesRow = {
+  ticker: string;
+  name: string;
+  exchange: string;
+  currency: string;
+  points: QuotePoint[];
+};
+
+/**
+ * Reads the shared cache, ignoring rows older than the TTL. Fails soft: a
+ * Supabase outage falls through to Twelve Data rather than taking the app
+ * down with it. Uses the service-role client because this module is
+ * server-only and holds no user session — quote_series is world-readable
+ * either way.
+ */
+async function readSharedCache(ticker: string): Promise<QuoteSeries | null> {
+  const freshAfter = new Date(Date.now() - SERIES_CACHE_TTL_MS).toISOString();
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("quote_series")
+      .select("ticker,name,exchange,currency,points")
+      .eq("ticker", ticker)
+      .gte("fetched_at", freshAfter)
+      .maybeSingle<QuoteSeriesRow>();
+
+    if (error || !data) return null;
+
+    // points is jsonb, so its shape is only as good as whatever wrote it.
+    if (!Array.isArray(data.points) || data.points.length < 20) return null;
+
+    return {
+      ticker: data.ticker,
+      name: data.name,
+      exchange: data.exchange,
+      currency: data.currency,
+      points: data.points,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Upserts a freshly fetched series. fetched_at is set explicitly because the
+ * column default only applies on INSERT — leaving it off would let an updated
+ * row keep its original timestamp and read as permanently stale.
+ */
+async function writeSharedCache(series: QuoteSeries): Promise<void> {
+  try {
+    const { error } = await supabaseAdmin.from("quote_series").upsert(
+      {
+        ticker: series.ticker,
+        name: series.name,
+        exchange: series.exchange,
+        currency: series.currency,
+        points: series.points,
+        fetched_at: new Date().toISOString(),
+      },
+      { onConflict: "ticker" }
+    );
+    if (error) console.error(`quote_series upsert failed for ${series.ticker}:`, error.message);
+  } catch (e) {
+    console.error(`quote_series upsert threw for ${series.ticker}:`, e);
+  }
 }
 
 async function fetchSeriesUncached(ticker: string): Promise<QuoteSeries> {
