@@ -124,6 +124,9 @@ async function readSharedCache(ticker: string): Promise<QuoteSeries | null> {
       .select("ticker,name,exchange,currency,points")
       .eq("ticker", ticker)
       .gte("fetched_at", freshAfter)
+      // An unreachable Supabase otherwise costs ~7 s of client retries before
+      // we fall through — far slower than just asking Yahoo.
+      .abortSignal(AbortSignal.timeout(2000))
       .maybeSingle<QuoteSeriesRow>();
 
     if (error || !data) return null;
