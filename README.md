@@ -139,6 +139,11 @@ public/sw.js      service worker
 Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS 4 · Vitest ·
 GitHub Actions
 
+## License
+
+The code is [MIT](LICENSE). That covers this repository only, not the market
+data the app fetches when you run it.
+
 ## Disclaimer
 
 Maximum drawdown is the largest decline from a prior peak during the chosen
