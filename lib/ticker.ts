@@ -1,4 +1,4 @@
-// Yahoo conventions: AAPL, 005930.KS, BTC-USD, ^GSPC, GC=F.
+// Yahoo conventions: AAPL, BRK-B, BTC-USD, ^GSPC, GC=F.
 export const TICKER_RE = /^[A-Z0-9.\-^=]{1,15}$/;
 
 export function normalizeTicker(raw: string): string {

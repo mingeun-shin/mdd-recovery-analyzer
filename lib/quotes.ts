@@ -222,7 +222,8 @@ async function fetchSeriesUncached(ticker: string): Promise<QuoteSeries> {
   // crypto pairs only have the raw close, which needs no adjusting anyway.
   const closes = result.indicators.adjclose?.[0]?.adjclose ?? result.indicators.quote[0]?.close ?? [];
   // Timestamps are the session open in UTC. Shifting by the exchange's offset
-  // before taking the date keeps e.g. a KST morning session on the right day.
+  // before taking the date keeps sessions that open before midnight UTC (most
+  // non-US exchanges) on the right trading day.
   const offsetMs = (result.meta.gmtoffset ?? 0) * 1000;
 
   // Spec §1: drop NaN closes, drop duplicate dates keeping the last, ascending.

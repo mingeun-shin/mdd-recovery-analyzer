@@ -151,7 +151,7 @@ export function AnalyzeClient() {
     if (!ticker) return { kind: "message", tone: "info", text: "Enter a ticker above, or pick one from your watchlist." } as View;
 
     const noData = (t: string) =>
-      `No valid data found for “${t}”. Check the ticker format (letter case, exchange suffix such as .KS or .KQ) and the date range.`;
+      `No valid data found for “${t}”. Check the ticker symbol and the date range.`;
 
     const prepare = (t: string, k: number): Prepared | "loading" | { notFound: true } | { error: string } => {
       const s = series[t];
