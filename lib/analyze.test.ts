@@ -115,6 +115,21 @@ describe("bucketRecovery", () => {
     expect(bucketRecovery(s, computeEpisodes(s)).map((b) => b.label)).toEqual(["0–5%", "10–15%"]);
   });
 
+  it("puts a drawdown that lands exactly on a band edge in the band above", () => {
+    // 100 → 95 is exactly -5%. The spec's floor((max - 1e-9) / 5) + 1 sized
+    // the bands so that the 5–10% band was never created and the episode
+    // vanished from the chart.
+    const s = daily([100, 95, 100]);
+    expect(bucketRecovery(s, computeEpisodes(s))).toEqual([
+      { lo: 5, hi: 10, label: "5–10%", count: 1, recovered: 1, prob: 100, avgDays: 1 },
+    ]);
+    const deeper = daily([100, 97, 100, 90, 100]);
+    expect(bucketRecovery(deeper, computeEpisodes(deeper)).map((b) => [b.label, b.count])).toEqual([
+      ["0–5%", 1],
+      ["10–15%", 1],
+    ]);
+  });
+
   it("returns nothing when there are no episodes", () => {
     expect(bucketRecovery(daily([1, 2]), [])).toEqual([]);
   });

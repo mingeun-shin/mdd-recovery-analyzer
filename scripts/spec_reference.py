@@ -96,7 +96,10 @@ def analyze(points):
     buckets = []
     if eps:
         max_depth = max(abs(e[3]) for e in eps)
-        n_buckets = int((max_depth - 1e-9) // 5) + 1
+        # The spec has (max_depth - 1e-9) here, which drops an episode that
+        # sits exactly on a band edge; lib/analyze.ts fixes that, so the
+        # reference follows the fix rather than the spec.
+        n_buckets = int(max_depth // 5) + 1
         for i in range(n_buckets):
             lo, hi = 5 * i, 5 * (i + 1)
             group = [e for e in eps if lo <= abs(e[3]) < hi]

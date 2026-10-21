@@ -99,7 +99,10 @@ export function computeEpisodes(series: SeriesPoint[]): Episode[] {
 export function bucketRecovery(series: SeriesPoint[], episodes: Episode[]): RecoveryBucket[] {
   if (!episodes.length) return [];
   const maxDepth = Math.max(...episodes.map((e) => Math.abs(e.depth)));
-  const nBuckets = Math.floor((maxDepth - 1e-9) / BUCKET_PCT) + 1;
+  // Deliberately not the spec's floor((max - 1e-9) / 5) + 1: that never
+  // creates the band for a depth sitting exactly on an edge (a $100 stock
+  // closing at $95), so the deepest episode could drop out of the chart.
+  const nBuckets = Math.floor(maxDepth / BUCKET_PCT) + 1;
 
   const buckets: RecoveryBucket[] = [];
   for (let i = 0; i < nBuckets; i++) {
