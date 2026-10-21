@@ -414,7 +414,9 @@ function TickerHeader({ item, compare }: { item: Prepared; compare: boolean }) {
         </div>
       </div>
 
-      <div className={compare ? "mt-6" : "ml-auto"}>
+      {/* md: only — once the row wraps on a phone, ml-auto would push the
+          price block to the right edge instead of under the name. */}
+      <div className={compare ? "mt-6" : "md:ml-auto"}>
         {quote.status === "loading" ? (
           <div className="type-caption text-ink-muted-48">Loading live price…</div>
         ) : !q ? (
@@ -500,7 +502,9 @@ function StatCards({ item, compare }: { item: Prepared; compare: boolean }) {
       )}
       <div
         className="grid gap-8 gap-x-10"
-        style={{ gridTemplateColumns: `repeat(auto-fit,minmax(${compare ? 160 : 200}px,1fr))` }}
+        // 260px in single mode is what the hero-sized MDD figure needs; any
+        // narrower and it spills into the next column at laptop widths.
+        style={{ gridTemplateColumns: `repeat(auto-fit,minmax(${compare ? 160 : 260}px,1fr))` }}
       >
         {cards.map((c, i) => (
           <div key={c.label}>
