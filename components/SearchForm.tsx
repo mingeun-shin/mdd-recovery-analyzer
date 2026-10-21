@@ -62,11 +62,8 @@ export function SearchForm() {
       return;
     }
     setOpen(false);
-    // Always start from the full available history — narrowing the range
-    // is easy from the results page once you can see what's there, but
-    // guessing a range up front risks landing on "not enough data" for
-    // recently-listed companies.
-    router.push(`/analyze?ticker=${encodeURIComponent(clean)}&range=Max`);
+    // No range param: the analyze page defaults to the last five years.
+    router.push(`/analyze?ticker=${encodeURIComponent(clean)}`);
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {

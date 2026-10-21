@@ -3,13 +3,12 @@ export function Footer() {
     <footer className="bg-parchment border-t border-hairline mt-auto">
       <div className="max-w-[1440px] mx-auto pad-safe-x pt-12 pad-safe-bottom">
         <p className="type-fine-print text-ink-muted-80 max-w-[70ch] text-pretty">
-          Maximum drawdown is the largest peak-to-trough decline in closing price within the
-          selected range. Recovery is the first close at or above the prior peak. Historical
-          recovery statistics describe this stock&apos;s own past episodes and carry no
-          predictive claim.
+          MDD (maximum drawdown) is the largest decline from a prior peak during the analysis period.
+          These results are reference statistics only and can&apos;t be used as the basis for an
+          investment decision or a product description.
         </p>
         <p className="type-micro-legal text-ink-muted-48 mt-6">
-          Price data via Twelve Data, may be delayed. Not investment advice.
+          Price data via Yahoo Finance, may be delayed. Not investment advice.
         </p>
       </div>
     </footer>

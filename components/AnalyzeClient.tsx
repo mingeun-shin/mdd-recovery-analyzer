@@ -1,294 +1,209 @@
 "use client";
 
-import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { GlobalNav } from "@/components/GlobalNav";
 import { Footer } from "@/components/Footer";
-import { DrawdownChart, type ChartAnnotation } from "@/components/DrawdownChart";
+import { DrawdownChart, type ChartItem } from "@/components/DrawdownChart";
+import { RecoveryChart } from "@/components/RecoveryChart";
 import { WatchButton } from "@/components/WatchButton";
+import { WatchlistBar } from "@/components/WatchlistBar";
 import { TickerLogo } from "@/components/TickerLogo";
 import {
-  analyze,
+  analyzeTicker,
+  currentDrawdown,
+  daysBetween,
   fmtDate,
-  fmtDur,
-  fmtMonth,
-  median,
-  money,
-  pct,
+  fmtDays,
+  fmtNum,
+  fmtPct,
+  fmtPrice,
+  fmtYm,
+  isoDate,
   type SeriesPoint,
+  type TickerAnalysis,
 } from "@/lib/analyze";
-import type { QuoteSeries } from "@/lib/quotes";
+import type { LiveQuote, QuoteSeries } from "@/lib/quotes";
+import { normalizeTicker } from "@/lib/ticker";
 
 const RANGES = ["YTD", "1Y", "3Y", "5Y", "10Y", "Max"] as const;
+const DEFAULT_RANGE = "5Y";
+const DEFAULT_TICKER = "SPY";
+const MIN_DATE = "1980-01-01";
 const DAY_MS = 86400000;
-const MIN_DEPTH_PCT = 10;
-const SIMILAR_BAND_PCT = 12;
-const MIN_POINTS = 60;
 const NEG = "#bf3a2c";
 const POS = "#1a7f4b";
+// Ticker A keeps the app's Action Blue; B is an orange validated against it
+// for colour-vision separation and contrast on the white canvas.
+const COLORS = ["#0066cc", "#c2620a"];
 
-type Status = "loading" | "error" | "ready";
+type Loaded<T> =
+  | { status: "loading" }
+  | { status: "ready"; data: T }
+  | { status: "error"; notFound: boolean; message: string };
+
+async function getJson<T>(url: string): Promise<Loaded<T>> {
+  try {
+    const res = await fetch(url);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return { status: "error", notFound: res.status === 404, message: body.error || `Request failed (${res.status}).` };
+    }
+    return { status: "ready", data: body as T };
+  } catch (err) {
+    return { status: "error", notFound: false, message: (err as Error).message };
+  }
+}
+
+function todayIso(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Spec defaults: end = today, start = today − 365 × years. */
+function presetBounds(range: string, today: string): { start: string; end: string } {
+  if (range === "Max") return { start: MIN_DATE, end: today };
+  if (range === "YTD") return { start: today.slice(0, 4) + "-01-01", end: today };
+  const years = ({ "1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10 } as Record<string, number>)[range] ?? 5;
+  return { start: isoDate(Date.parse(today) - years * 365 * DAY_MS), end: today };
+}
+
+function slice(points: QuoteSeries["points"], start: string, end: string): SeriesPoint[] {
+  // ISO dates compare correctly as strings, so no parsing until we keep a point.
+  return points.filter((p) => p.t >= start && p.t <= end).map((p) => ({ ms: Date.parse(p.t), p: p.c }));
+}
+
+type Prepared = {
+  ticker: string;
+  color: string;
+  info: QuoteSeries;
+  series: SeriesPoint[];
+  analysis: TickerAnalysis;
+  quote: Loaded<LiveQuote>;
+};
 
 export function AnalyzeClient() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const ticker = (searchParams.get("ticker") || "").toUpperCase();
 
-  const [status, setStatus] = useState<Status>("loading");
-  const [errorMsg, setErrorMsg] = useState("");
-  const [quote, setQuote] = useState<QuoteSeries | null>(null);
-  const [tab, setTab] = useState<"underwater" | "price">("underwater");
+  // An absent ?ticker= means first load (spec default SPY); a present-but-empty
+  // one means the user cleared the field, which gets the "enter a ticker" note.
+  const tickerParam = searchParams.get("ticker");
+  const ticker = normalizeTicker(tickerParam ?? DEFAULT_TICKER);
+  const vs = normalizeTicker(searchParams.get("vs") ?? "");
+  const range = searchParams.get("range") || DEFAULT_RANGE;
 
-  const [range, setRangeState] = useState<string>(searchParams.get("range") || "Max");
-  const [start, setStart] = useState<string>(searchParams.get("start") || "");
-  const [end, setEnd] = useState<string>(searchParams.get("end") || "");
+  const today = todayIso();
+  const { start, end } =
+    range === "Custom"
+      ? { start: searchParams.get("start") || presetBounds(DEFAULT_RANGE, today).start, end: searchParams.get("end") || today }
+      : presetBounds(range, today);
+
+  const compareRequested = vs !== "" && vs !== ticker;
+
+  const [runId, setRunId] = useState(0);
+  // A ticker with no entry yet reads as loading. On a re-run the previous
+  // result stays up until the fresh one replaces it.
+  const [series, setSeries] = useState<Record<string, Loaded<QuoteSeries>>>({});
+  const [quotes, setQuotes] = useState<Record<string, Loaded<LiveQuote>>>({});
 
   useEffect(() => {
-    if (!ticker) {
-      setStatus("error");
-      setErrorMsg("No ticker given.");
-      return;
+    const wanted = [ticker, compareRequested ? vs : ""].filter(Boolean);
+    for (const t of wanted) {
+      // Results are keyed by ticker, so a slow response landing after the
+      // user has moved on just fills the cache rather than clobbering anything.
+      getJson<QuoteSeries>(`/api/series?ticker=${encodeURIComponent(t)}`).then((r) =>
+        setSeries((prev) => ({ ...prev, [t]: r }))
+      );
+      getJson<LiveQuote>(`/api/quote?ticker=${encodeURIComponent(t)}`).then((r) =>
+        setQuotes((prev) => ({ ...prev, [t]: r }))
+      );
     }
-    let cancelled = false;
-    setStatus("loading");
-    fetch(`/api/series?ticker=${encodeURIComponent(ticker)}`)
-      .then(async (res) => {
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.error || "Failed to load price data.");
-        return body as QuoteSeries;
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setQuote(data);
-        setStatus("ready");
-      })
-      .catch((err: Error) => {
-        if (cancelled) return;
-        setErrorMsg(err.message);
-        setStatus("error");
-      });
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ticker]);
+  }, [ticker, vs, compareRequested, runId]);
 
-  const fullSeries: SeriesPoint[] = useMemo(() => {
-    if (!quote) return [];
-    return quote.points.map((p) => ({ ms: Date.parse(p.t), p: p.c }));
-  }, [quote]);
-
-  function pushUrl(nextRange: string, nextStart: string, nextEnd: string) {
-    const params = new URLSearchParams({ ticker });
+  function navigate(next: { ticker?: string; vs?: string; range?: string; start?: string; end?: string }) {
+    const params = new URLSearchParams();
+    params.set("ticker", next.ticker ?? ticker);
+    const nextVs = next.vs ?? vs;
+    if (nextVs) params.set("vs", nextVs);
+    const nextRange = next.range ?? range;
     params.set("range", nextRange);
-    if (nextRange === "Custom" && nextStart && nextEnd) {
-      params.set("start", nextStart);
-      params.set("end", nextEnd);
+    if (nextRange === "Custom") {
+      params.set("start", next.start ?? start);
+      params.set("end", next.end ?? end);
     }
     router.replace(`/analyze?${params.toString()}`, { scroll: false });
   }
 
-  function setRange(r: string) {
-    setRangeState(r);
-    setStart("");
-    setEnd("");
-    pushUrl(r, "", "");
+  function run(nextTicker: string, nextVs: string) {
+    navigate({ ticker: normalizeTicker(nextTicker), vs: normalizeTicker(nextVs) });
+    setRunId((n) => n + 1);
   }
 
-  function onStartChange(v: string) {
-    setStart(v);
-    setRangeState("Custom");
-    pushUrl("Custom", v, end);
-  }
-  function onEndChange(v: string) {
-    setEnd(v);
-    setRangeState("Custom");
-    pushUrl("Custom", start, v);
-  }
+  // ---- Resolve what to show (spec §2 validation, in order) ----
+  const view = useMemo(() => {
+    type View =
+      | { kind: "message"; tone: "error" | "info"; text: string }
+      | { kind: "loading" }
+      | { kind: "ready"; items: Prepared[]; warning: string | null };
 
-  const bounds = useMemo(() => {
-    if (!fullSeries.length) return null;
-    const lastMs = fullSeries[fullSeries.length - 1].ms;
-    if (range === "Custom" && start && end) {
-      return { a: Date.parse(start), b: Date.parse(end) };
-    }
-    if (range === "YTD") {
-      const jan1 = Date.UTC(new Date(lastMs).getUTCFullYear(), 0, 1);
-      return { a: jan1, b: lastMs };
-    }
-    const yrs = ({ "1Y": 1, "3Y": 3, "5Y": 5, "10Y": 10 } as Record<string, number>)[range];
-    return { a: yrs ? lastMs - yrs * 365.25 * DAY_MS : fullSeries[0].ms, b: lastMs };
-  }, [fullSeries, range, start, end]);
+    if (start >= end) return { kind: "message", tone: "error", text: "Start date must be earlier than end date." } as View;
+    if (!ticker) return { kind: "message", tone: "info", text: "Enter a ticker above, or pick one from your watchlist." } as View;
 
-  const viewSeries = useMemo(() => {
-    if (!bounds) return [];
-    return fullSeries.filter((d) => d.ms >= bounds.a && d.ms <= bounds.b);
-  }, [fullSeries, bounds]);
+    const noData = (t: string) =>
+      `No valid data found for “${t}”. Check the ticker format (letter case, exchange suffix such as .KS or .KQ) and the date range.`;
 
-  const insufficientData = status === "ready" && viewSeries.length < MIN_POINTS;
-
-  const vm = useMemo(() => {
-    if (!quote || viewSeries.length < MIN_POINTS) return null;
-    const currency = quote.currency;
-    const A = analyze(viewSeries, MIN_DEPTH_PCT);
-    const n = viewSeries.length;
-    const last = viewSeries[n - 1];
-    const m = A.main;
-    const recovered = m.recIdx != null;
-    const recoveredPct = Math.max(
-      0,
-      Math.min(100, Math.round(((last.p - m.troughPrice) / (m.peakPrice - m.troughPrice)) * 100))
-    );
-    const underwaterDays = Math.round((last.ms - viewSeries[m.peakIdx].ms) / DAY_MS);
-
-    const fullA = analyze(fullSeries, MIN_DEPTH_PCT);
-    const threshold = Math.max(MIN_DEPTH_PCT, Math.abs(m.depth) * 100 - SIMILAR_BAND_PCT);
-    const similar = fullA.episodes.filter((e) => Math.abs(e.depth) * 100 >= threshold);
-    const simRec = similar.filter((e) => e.recIdx != null);
-    const medRec = median(simRec.map((e) => e.recDays as number));
-    const maxRec = simRec.length ? Math.max(...simRec.map((e) => e.recDays as number)) : null;
-
-    const annotations: ChartAnnotation[] = [];
-    if (tab === "price") annotations.push({ i: m.peakIdx, label: "Peak " + money(m.peakPrice, currency), color: "#1d1d1f", up: true });
-    annotations.push({ i: m.troughIdx, label: "Trough " + pct(m.depth), color: NEG, up: false });
-    if (recovered) annotations.push({ i: m.recIdx as number, label: "Recovered", color: POS, up: true });
-
-    const histBuckets: { lo: number; hi: number; label: string; count: number }[] = [];
-    const edges = [MIN_DEPTH_PCT, 20, 30, 40, 50, 60];
-    for (let k = 0; k < edges.length; k++) {
-      const lo = edges[k];
-      const hiE = k === edges.length - 1 ? 200 : edges[k + 1];
-      if (lo >= hiE) continue;
-      histBuckets.push({ lo, hi: hiE, label: k === edges.length - 1 ? lo + "+" : `${lo}–${hiE}`, count: 0 });
-    }
-    A.episodes.forEach((e) => {
-      const d = Math.abs(e.depth) * 100;
-      for (const b of histBuckets) {
-        if (d >= b.lo && d < b.hi) {
-          b.count++;
-          break;
-        }
-      }
-    });
-    const maxCount = Math.max(1, ...histBuckets.map((b) => b.count));
-    const curDepth = Math.abs(m.depth) * 100;
-    let currentBucketLabel = histBuckets[histBuckets.length - 1]?.label ?? "";
-    histBuckets.forEach((b) => {
-      if (curDepth >= b.lo && curDepth < b.hi) currentBucketLabel = b.label;
-    });
-    const histogram = histBuckets.map((b, k) => {
-      const active = curDepth >= b.lo && curDepth < b.hi;
-      return {
-        label: b.label,
-        count: b.count,
-        h: Math.round((b.count / maxCount) * 168),
-        fill: b.count === 0 ? "#f5f5f7" : `rgba(191,58,44,${(0.28 + 0.12 * k).toFixed(2)})`,
-        border: active ? `2px solid ${NEG}` : "2px solid transparent",
-        countColor: active ? NEG : "#7a7a7a",
-      };
-    });
-
-    const episodes = [...A.episodes]
-      .sort((a, b) => a.depth - b.depth)
-      .map((e) => ({
-        peak: fmtDate(viewSeries[e.peakIdx].ms),
-        trough: fmtDate(viewSeries[e.troughIdx].ms),
-        depth: pct(e.depth),
-        fall: fmtDur(e.fallDays),
-        recovery: e.recIdx == null ? "—" : fmtDur(e.recDays),
-        status: e.recIdx == null ? "Underwater" : "Recovered",
-        statusColor: e.recIdx == null ? NEG : POS,
-      }));
-
-    return {
-      currency,
-      last,
-      m,
-      recovered,
-      recoveredPct,
-      underwaterDays,
-      A,
-      similar,
-      simRec,
-      medRec,
-      maxRec,
-      threshold,
-      annotations,
-      histogram,
-      currentBucketLabel,
-      episodes,
+    const prepare = (t: string, k: number): Prepared | "loading" | { notFound: true } | { error: string } => {
+      const s = series[t];
+      if (!s || s.status === "loading") return "loading";
+      if (s.status === "error") return s.notFound ? { notFound: true } : { error: s.message };
+      const view = slice(s.data.points, start, end);
+      if (view.length < 2) return { notFound: true };
+      return { ticker: t, color: COLORS[k], info: s.data, series: view, analysis: analyzeTicker(view), quote: quotes[t] ?? { status: "loading" } };
     };
-  }, [quote, viewSeries, fullSeries, tab]);
 
-  if (status === "loading") {
-    return (
-      <>
-        <GlobalNav />
-        <main className="flex-1 bg-parchment flex items-center justify-center">
-          <div className="text-center max-w-[420px] px-6">
-            <div className="type-display-md">{ticker || "…"}</div>
-            <div className="type-body text-ink-muted-80 mt-2">Computing running peak and drawdown episodes.</div>
-            <div className="mt-8 h-[3px] bg-hairline rounded-pill overflow-hidden relative">
-              <div className="absolute inset-y-0 w-1/4 bg-primary rounded-pill animate-[dd-sweep_900ms_ease-in-out_infinite]" />
-            </div>
-          </div>
-        </main>
-        <Footer />
-      </>
-    );
-  }
+    const a = prepare(ticker, 0);
+    if (a === "loading") return { kind: "loading" } as View;
+    if ("notFound" in a) return { kind: "message", tone: "error", text: noData(ticker) } as View;
+    if ("error" in a) return { kind: "message", tone: "error", text: `Couldn't load data: ${a.error}` } as View;
 
-  if (status === "error" || insufficientData || !vm) {
-    return (
-      <>
-        <GlobalNav />
-        <main className="flex-1 bg-parchment flex items-center justify-center">
-          <div className="max-w-[520px] px-6 text-center">
-            <div className="type-display-lg">No data for that range.</div>
-            <p className="type-body text-ink-muted-80 mt-4 mb-8 text-pretty">
-              {status === "error"
-                ? errorMsg || "A drawdown needs at least a few months of closes. Widen the date range or pick a different ticker."
-                : "A drawdown needs at least a few months of closes. Widen the date range or pick a different ticker."}
-            </p>
-            <Link
-              href="/"
-              className="inline-block h-11 px-7 rounded-pill bg-primary text-on-primary type-body leading-[44px] active:scale-95 transition-transform"
-            >
-              Start over
-            </Link>
-          </div>
-        </main>
-        <Footer />
-      </>
-    );
-  }
+    if (!compareRequested) return { kind: "ready", items: [a], warning: null } as View;
 
-  const { currency, last, m, recovered, recoveredPct, underwaterDays, A, similar, simRec, medRec, maxRec, threshold, annotations, histogram, currentBucketLabel, episodes } = vm;
-  const n = viewSeries.length;
-  const rangeLabel = `${range === "Custom" ? "Custom range" : range} · ${fmtMonth(viewSeries[0].ms)} – ${fmtMonth(last.ms)}`;
+    const b = prepare(vs, 1);
+    if (b === "loading") return { kind: "loading" } as View;
+    if ("error" in b) return { kind: "message", tone: "error", text: `Couldn't load data: ${b.error}` } as View;
+    if ("notFound" in b) {
+      return {
+        kind: "ready",
+        items: [a],
+        warning: `Couldn't find data for comparison ticker “${vs}”, so only ${ticker} is shown.`,
+      } as View;
+    }
+    return { kind: "ready", items: [a, b], warning: null } as View;
+  }, [series, quotes, ticker, vs, compareRequested, start, end]);
+
+  const pillStyle = (on: boolean) =>
+    on
+      ? { background: "var(--color-primary)", color: "#fff", borderColor: "var(--color-primary)" }
+      : { background: "var(--color-canvas)", color: "var(--color-ink)", borderColor: "var(--color-hairline)" };
 
   return (
     <>
       <GlobalNav />
 
       <div className="sticky top-0 z-30 border-b border-hairline backdrop-blur-xl" style={{ background: "rgba(245,245,247,0.8)" }}>
-        <div className="max-w-[1440px] mx-auto px-6 min-h-[52px] flex items-center gap-6 flex-wrap">
-          <div className="flex items-baseline gap-2.5 py-2">
-            <span className="type-tagline">{ticker}</span>
-            <span className="type-caption text-ink-muted-48">{quote?.name}</span>
-          </div>
-          <div className="ml-auto flex items-center gap-2 flex-wrap py-2">
+        <div className="max-w-[1440px] mx-auto px-6 py-2 flex items-center gap-x-6 gap-y-2 flex-wrap">
+          {/* Keyed on the URL tickers so the fields reset when they change
+              underneath (watchlist taps, back/forward). */}
+          <TickerForm key={`${ticker}|${vs}`} ticker={ticker} vs={vs} onRun={run} />
+
+          <div className="ml-auto flex items-center gap-2 flex-wrap">
             {RANGES.map((r) => (
               <button
                 key={r}
-                onClick={() => setRange(r)}
+                onClick={() => navigate({ range: r })}
                 className="type-caption h-8 px-3.5 rounded-pill border cursor-pointer"
-                style={
-                  range === r
-                    ? { background: "var(--color-primary)", color: "#fff", borderColor: "var(--color-primary)" }
-                    : { background: "var(--color-canvas)", color: "var(--color-ink)", borderColor: "var(--color-hairline)" }
-                }
+                style={pillStyle(range === r)}
               >
                 {r}
               </button>
@@ -296,269 +211,392 @@ export function AnalyzeClient() {
             <span className="w-px h-6 bg-hairline mx-1" />
             <input
               type="date"
-              value={start || (bounds ? new Date(bounds.a).toISOString().slice(0, 10) : "")}
-              onChange={(e) => onStartChange(e.target.value)}
+              value={start}
+              min={MIN_DATE}
+              max={today}
+              aria-label="Start date"
+              onChange={(e) => e.target.value && navigate({ range: "Custom", start: e.target.value })}
               className="type-caption h-8 px-3.5 rounded-pill border border-hairline bg-canvas outline-none"
             />
             <span className="type-caption text-ink-muted-48">&rarr;</span>
             <input
               type="date"
-              value={end || (bounds ? new Date(bounds.b).toISOString().slice(0, 10) : "")}
-              onChange={(e) => onEndChange(e.target.value)}
+              value={end}
+              min={MIN_DATE}
+              max={today}
+              aria-label="End date"
+              onChange={(e) => e.target.value && navigate({ range: "Custom", end: e.target.value })}
               className="type-caption h-8 px-3.5 rounded-pill border border-hairline bg-canvas outline-none"
             />
-            <WatchButton ticker={ticker} />
-            <Link
-              href="/"
-              className="type-caption h-8 px-4 rounded-pill bg-primary text-white ml-1 flex items-center"
-            >
-              New analysis
-            </Link>
+            {ticker && <WatchButton ticker={ticker} />}
           </div>
         </div>
       </div>
 
-      <main className="animate-[dd-fade_240ms_ease-out]">
-        <section className="bg-canvas border-b border-divider-soft">
-          <div className="max-w-[1440px] mx-auto px-6 pt-10 pb-8 flex items-end gap-8 flex-wrap">
-            <div className="flex items-center gap-4 flex-1 min-w-[300px]">
-              <TickerLogo ticker={ticker} size={56} fontSize={18} />
-              <div className="min-w-0">
-                <div className="type-display-md text-[28px]! leading-tight truncate">{quote?.name}</div>
-                <div className="type-caption text-ink-muted-48 mt-1.5">
-                  {quote?.exchange} &middot; {rangeLabel} &middot; {n.toLocaleString()} daily closes
-                </div>
-              </div>
-            </div>
-            <div className="ml-auto flex items-end gap-8">
-              <div>
-                <div className="type-caption text-ink-muted-48">Last close</div>
-                <div className="type-display-md text-[34px]! leading-tight">{money(last.p, currency)}</div>
-              </div>
-              <div className="pb-1.5">
-                <span
-                  className="inline-block px-3.5 py-1.5 rounded-pill type-caption-strong"
-                  style={{ background: recovered ? "var(--color-positive-soft)" : "var(--color-negative-soft)", color: recovered ? POS : NEG }}
-                >
-                  {recovered ? "Recovered" : "Still underwater"}
-                </span>
-              </div>
+      <div className="bg-canvas border-b border-divider-soft">
+        <div className="max-w-[1440px] mx-auto px-6 py-3">
+          <WatchlistBar active={ticker} onSelect={(t) => navigate({ ticker: t })} />
+        </div>
+      </div>
+
+      {view.kind === "loading" && (
+        <main className="flex-1 bg-parchment flex items-center justify-center py-24">
+          <div className="text-center max-w-[420px] px-6">
+            <div className="type-display-md">{compareRequested ? `${ticker} vs ${vs}` : ticker}</div>
+            <div className="type-body text-ink-muted-80 mt-2">Computing running peak and drawdown episodes.</div>
+            <div className="mt-8 h-[3px] bg-hairline rounded-pill overflow-hidden relative">
+              <div className="absolute inset-y-0 w-1/4 bg-primary rounded-pill animate-[dd-sweep_900ms_ease-in-out_infinite]" />
             </div>
           </div>
-        </section>
+        </main>
+      )}
 
-        <section className="bg-parchment">
-          <div className="max-w-[1440px] mx-auto px-6 py-8">
-            <div className="bg-canvas border border-hairline rounded-lg p-6 grid gap-8 gap-x-10" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(228px,1fr))" }}>
-              <div>
-                <div className="type-caption text-ink-muted-48">Maximum drawdown</div>
-                <div className="type-hero-display mt-1" style={{ color: NEG }}>{pct(m.depth)}</div>
-                <div className="type-caption text-ink-muted-80 mt-2">
-                  Peak {fmtDate(viewSeries[m.peakIdx].ms)} at {money(m.peakPrice, currency)} &rarr; trough {fmtDate(viewSeries[m.troughIdx].ms)} at {money(m.troughPrice, currency)}
-                </div>
-              </div>
-              <div>
-                <div className="type-caption text-ink-muted-48">Decline lasted</div>
-                <div className="type-lead text-[28px]! mt-1.5">{fmtDur(m.fallDays)}</div>
-                <div className="type-caption text-ink-muted-48 mt-2">{m.fallDays.toLocaleString()} days peak to trough</div>
-              </div>
-              <div>
-                <div className="type-caption text-ink-muted-48">{recovered ? "Time to recover" : "Underwater for"}</div>
-                <div className="type-lead text-[28px]! mt-1.5" style={{ color: recovered ? POS : NEG }}>
-                  {recovered ? fmtDur(m.recDays) : fmtDur(underwaterDays)}
-                </div>
-                <div className="type-caption text-ink-muted-48 mt-2">
-                  {recovered ? `New high on ${fmtDate(viewSeries[m.recIdx as number].ms)}` : `and counting, as of ${fmtDate(last.ms)}`}
-                </div>
-              </div>
-              <div>
-                <div className="type-caption text-ink-muted-48">Below peak today</div>
-                <div className="type-lead text-[28px]! mt-1.5" style={{ color: A.currentDD <= -0.0005 ? NEG : POS }}>
-                  {A.currentDD <= -0.0005 ? pct(A.currentDD) : "At high"}
-                </div>
-                <div className="type-caption text-ink-muted-48 mt-2">Running peak {money(A.runningPeak, currency)}</div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="bg-parchment">
-          <div className="max-w-[1440px] mx-auto px-6 pb-8 grid gap-6 items-start" style={{ gridTemplateColumns: "minmax(0,2.3fr) minmax(300px,1fr)" }}>
-            <div className="bg-canvas border border-hairline rounded-lg p-6">
-              <div className="flex items-start gap-6 flex-wrap mb-5">
-                <div>
-                  <div className="type-tagline">{tab === "underwater" ? "Underwater curve" : "Price with drawdown marks"}</div>
-                  <div className="type-caption text-ink-muted-48 mt-1">
-                    {tab === "underwater" ? "Percent below the running peak, daily." : "Log scale. Peak, trough and recovery marked."}
-                  </div>
-                </div>
-                <div className="ml-auto flex gap-2">
-                  <button
-                    onClick={() => setTab("underwater")}
-                    className="type-caption h-8 px-4 rounded-pill border cursor-pointer"
-                    style={tab === "underwater" ? { background: "var(--color-ink)", color: "#fff", borderColor: "var(--color-ink)" } : { background: "#fff", color: "var(--color-ink)", borderColor: "var(--color-hairline)" }}
-                  >
-                    Underwater
-                  </button>
-                  <button
-                    onClick={() => setTab("price")}
-                    className="type-caption h-8 px-4 rounded-pill border cursor-pointer"
-                    style={tab === "price" ? { background: "var(--color-ink)", color: "#fff", borderColor: "var(--color-ink)" } : { background: "#fff", color: "var(--color-ink)", borderColor: "var(--color-hairline)" }}
-                  >
-                    Price
-                  </button>
-                </div>
-              </div>
-
-              <DrawdownChart series={viewSeries} dd={A.dd} tab={tab} annotations={annotations} currency={currency} />
-
-              <div className="flex gap-6 flex-wrap mt-5 pt-4 border-t border-divider-soft">
-                <span className="type-micro-legal text-ink-muted-48">
-                  {tab === "underwater"
-                    ? "Zero means the price is making a new high. The shaded depth is the pain an investor was holding through."
-                    : "Dashed verticals mark the peak, trough and recovery of the deepest decline in range."}
-                </span>
-              </div>
-            </div>
-
-            <div className="grid gap-6">
-              <div className="bg-canvas border border-hairline rounded-lg p-6">
-                <div className="type-tagline">Position vs peak</div>
-                <div className="type-caption text-ink-muted-48 mt-1">Where the price sits between the trough and the prior high.</div>
-
-                <div className="flex items-baseline gap-2 mt-5">
-                  <span className="type-display-lg" style={{ color: recoveredPct >= 100 ? POS : recoveredPct >= 50 ? "var(--color-primary)" : NEG }}>
-                    {recoveredPct}%
-                  </span>
-                  <span className="type-caption text-ink-muted-48">of the loss recovered</span>
-                </div>
-
-                <div className="mt-5">
-                  <div className="relative h-3 rounded-pill bg-parchment border border-hairline overflow-hidden">
-                    <div
-                      className="absolute inset-y-0 left-0 rounded-pill"
-                      style={{ width: `${recoveredPct}%`, background: recoveredPct >= 100 ? POS : recoveredPct >= 50 ? "var(--color-primary)" : NEG }}
-                    />
-                  </div>
-                  <div className="flex justify-between mt-2 type-caption text-ink-muted-48">
-                    <span>Trough {money(m.troughPrice, currency)}</span>
-                    <span>Peak {money(m.peakPrice, currency)}</span>
-                  </div>
-                </div>
-
-                <div className="mt-6">
-                  {[
-                    { k: "Prior peak", v: money(m.peakPrice, currency), color: "var(--color-ink)" },
-                    { k: "Trough", v: money(m.troughPrice, currency), color: NEG },
-                    { k: "Last close", v: money(last.p, currency), color: "var(--color-ink)" },
-                    { k: "Gain needed to reclaim peak", v: recovered ? "—" : pct(m.peakPrice / last.p - 1), color: recovered ? "var(--color-ink-muted-48)" : POS },
-                  ].map((row) => (
-                    <div key={row.k} className="flex justify-between items-baseline py-2.5 border-t border-divider-soft">
-                      <span className="type-caption text-ink-muted-48">{row.k}</span>
-                      <span className="type-body-strong tabular-nums" style={{ color: row.color }}>{row.v}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="bg-canvas border border-hairline rounded-lg p-6">
-                <div className="type-tagline">Historical recovery</div>
-                <div className="type-caption text-ink-muted-48 mt-1">
-                  Declines of {Math.round(threshold)}% or deeper across the full record since {new Date(fullSeries[0].ms).getUTCFullYear()}.
-                </div>
-
-                <div className="flex items-baseline gap-2 mt-5">
-                  <span className="type-display-lg whitespace-nowrap" style={{ color: POS }}>
-                    {simRec.length} of {similar.length}
-                  </span>
-                  <span className="type-caption text-ink-muted-48">came back to the old high</span>
-                </div>
-
-                <div className="mt-6">
-                  {[
-                    { k: "Comparable drawdowns", v: String(similar.length) },
-                    { k: "Recovered to prior high", v: String(simRec.length) },
-                    { k: "Median time to recover", v: fmtDur(medRec) },
-                    { k: "Longest recovery", v: fmtDur(maxRec) },
-                  ].map((row) => (
-                    <div key={row.k} className="flex justify-between items-baseline py-2.5 border-t border-divider-soft">
-                      <span className="type-caption text-ink-muted-48">{row.k}</span>
-                      <span className="type-body-strong tabular-nums">{row.v}</span>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="type-micro-legal text-ink-muted-48 mt-4 pt-4 border-t border-divider-soft">
-                  Past behaviour of this stock only. Not a forecast.
-                </div>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section className="bg-canvas">
-          <div className="max-w-[1440px] mx-auto px-6 pt-12 pb-16 grid gap-6 items-start" style={{ gridTemplateColumns: "minmax(320px,1fr) minmax(0,1.6fr)" }}>
-            <div>
-              <div className="type-display-md">How deep, how often</div>
-              <p className="type-body text-ink-muted-80 mt-3 max-w-[44ch] text-pretty">
-                Every distinct decline of {MIN_DEPTH_PCT}% or more in the selected range, grouped by depth. The deepest decline in this range sits in the {currentBucketLabel} band.
+      {view.kind === "message" && (
+        <main className="flex-1 bg-parchment">
+          <div className="max-w-[720px] mx-auto px-6 py-16">
+            <div className="bg-canvas border border-hairline rounded-lg p-8">
+              <p className="type-body text-pretty" style={{ color: view.tone === "error" ? NEG : "var(--color-ink-muted-80)" }}>
+                {view.text}
               </p>
-
-              <div className="mt-8 flex items-end gap-3" style={{ height: 200 }}>
-                {histogram.map((b) => (
-                  <div key={b.label} className="flex-1 flex flex-col items-center justify-end h-full gap-2">
-                    <span className="type-caption-strong" style={{ color: b.countColor }}>{b.count}</span>
-                    <div className="w-full rounded-t-sm" style={{ background: b.fill, height: Math.max(2, b.h), border: b.border }} />
-                  </div>
-                ))}
-              </div>
-              <div className="flex gap-3 mt-2 pt-2 border-t border-hairline">
-                {histogram.map((b) => (
-                  <div key={b.label} className="flex-1 text-center type-caption text-ink-muted-48 whitespace-nowrap">
-                    {b.label}
-                  </div>
-                ))}
-              </div>
-              <div className="type-caption text-ink-muted-48 mt-4">Episode count by peak-to-trough depth, in percent.</div>
-            </div>
-
-            <div className="border border-hairline rounded-lg overflow-hidden">
-              <div className="px-6 py-5 border-b border-hairline flex items-baseline gap-3 flex-wrap">
-                <span className="type-tagline">Drawdown history</span>
-                <span className="type-caption text-ink-muted-48 ml-auto">{episodes.length} episodes &middot; deepest first</span>
-              </div>
-              <div className="max-h-[440px] overflow-auto">
-                <table className="w-full border-collapse tabular-nums">
-                  <thead>
-                    <tr className="sticky top-0 bg-pearl">
-                      <th className="text-left px-6 py-3 type-caption-strong text-ink-muted-48 border-b border-hairline">Peak</th>
-                      <th className="text-left px-3 py-3 type-caption-strong text-ink-muted-48 border-b border-hairline">Trough</th>
-                      <th className="text-right px-3 py-3 type-caption-strong text-ink-muted-48 border-b border-hairline">Depth</th>
-                      <th className="text-right px-3 py-3 type-caption-strong text-ink-muted-48 border-b border-hairline">Fall</th>
-                      <th className="text-right px-3 py-3 type-caption-strong text-ink-muted-48 border-b border-hairline">Recovery</th>
-                      <th className="text-right px-6 py-3 type-caption-strong text-ink-muted-48 border-b border-hairline">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {episodes.map((ep, idx) => (
-                      <tr key={idx}>
-                        <td className="px-6 py-3.5 type-caption border-b border-divider-soft whitespace-nowrap">{ep.peak}</td>
-                        <td className="px-3 py-3.5 type-caption border-b border-divider-soft whitespace-nowrap text-ink-muted-80">{ep.trough}</td>
-                        <td className="px-3 py-3.5 type-caption-strong border-b border-divider-soft text-right" style={{ color: NEG }}>{ep.depth}</td>
-                        <td className="px-3 py-3.5 type-caption border-b border-divider-soft text-right text-ink-muted-80 whitespace-nowrap">{ep.fall}</td>
-                        <td className="px-3 py-3.5 type-caption border-b border-divider-soft text-right text-ink-muted-80 whitespace-nowrap">{ep.recovery}</td>
-                        <td className="px-6 py-3.5 type-caption-strong border-b border-divider-soft text-right whitespace-nowrap" style={{ color: ep.statusColor }}>{ep.status}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
             </div>
           </div>
-        </section>
-      </main>
+        </main>
+      )}
+
+      {view.kind === "ready" && <Results items={view.items} warning={view.warning} />}
 
       <Footer />
     </>
+  );
+}
+
+function TickerForm({ ticker, vs, onRun }: { ticker: string; vs: string; onRun: (ticker: string, vs: string) => void }) {
+  const [tickerDraft, setTickerDraft] = useState(ticker);
+  const [vsDraft, setVsDraft] = useState(vs);
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        onRun(tickerDraft, vsDraft);
+      }}
+      className="flex items-center gap-2 flex-wrap"
+    >
+      <input
+        type="text"
+        value={tickerDraft}
+        onChange={(e) => setTickerDraft(e.target.value)}
+        placeholder="Ticker, e.g. SPY"
+        aria-label="Ticker"
+        autoComplete="off"
+        className="type-caption-strong h-8 w-32 px-3.5 rounded-pill border border-hairline bg-canvas outline-none focus-visible:border-primary"
+      />
+      <span className="type-caption text-ink-muted-48">vs</span>
+      <input
+        type="text"
+        value={vsDraft}
+        onChange={(e) => setVsDraft(e.target.value)}
+        placeholder="Compare (optional)"
+        aria-label="Comparison ticker"
+        autoComplete="off"
+        className="type-caption h-8 w-40 px-3.5 rounded-pill border border-hairline bg-canvas outline-none focus-visible:border-primary"
+      />
+      <button type="submit" className="type-caption h-8 px-4 rounded-pill bg-primary text-white cursor-pointer active:scale-95 transition-transform">
+        Analyze
+      </button>
+    </form>
+  );
+}
+
+function Results({ items, warning }: { items: Prepared[]; warning: string | null }) {
+  const compare = items.length > 1;
+  // minmax(0,1fr) columns, so wide tables scroll inside their card instead of
+  // stretching the grid track (and the whole page) past a phone's width.
+  const cols = compare ? "grid gap-6 grid-cols-1 lg:grid-cols-2" : "grid gap-6 grid-cols-1";
+
+  const chartItems: ChartItem[] = useMemo(
+    () => items.map((it) => ({ ticker: it.ticker, color: it.color, series: it.series, mdd: it.analysis.mdd })),
+    [items]
+  );
+  const anyEpisodes = items.some((it) => it.analysis.episodes.length > 0);
+
+  return (
+    <main className="animate-[dd-fade_240ms_ease-out]">
+      {warning && (
+        <div className="bg-parchment">
+          <div className="max-w-[1440px] mx-auto px-6 pt-6">
+            <div className="bg-canvas border border-hairline rounded-lg px-5 py-3.5 type-caption text-ink-muted-80">{warning}</div>
+          </div>
+        </div>
+      )}
+
+      <section className="bg-canvas border-b border-divider-soft">
+        <div className={`max-w-[1440px] mx-auto px-6 pt-10 pb-8 ${cols}`}>
+          {items.map((it) => (
+            <TickerHeader key={it.ticker} item={it} compare={compare} />
+          ))}
+        </div>
+      </section>
+
+      <section className="bg-parchment">
+        <div className={`max-w-[1440px] mx-auto px-6 py-8 ${cols}`}>
+          {items.map((it) => (
+            <StatCards key={it.ticker} item={it} compare={compare} />
+          ))}
+        </div>
+      </section>
+
+      <section className="bg-parchment">
+        <div className="max-w-[1440px] mx-auto px-6 pb-8">
+          <div className="bg-canvas border border-hairline rounded-lg p-6">
+            <div className="type-tagline">Price and drawdown</div>
+            <div className="type-caption text-ink-muted-48 mt-1 mb-5">
+              {compare
+                ? "Each ticker is indexed to 100 on its own first date in range. Below, the percent each sits under its running peak."
+                : "Adjusted close against its running peak (dashed); the shaded gap is time spent below the prior high."}
+            </div>
+            <DrawdownChart items={chartItems} />
+          </div>
+        </div>
+      </section>
+
+      <section className="bg-parchment">
+        <div className={`max-w-[1440px] mx-auto px-6 pb-8 ${cols}`}>
+          {items.map((it) => (
+            <EpisodesTable key={it.ticker} item={it} compare={compare} />
+          ))}
+        </div>
+      </section>
+
+      <section className="bg-canvas">
+        <div className="max-w-[1440px] mx-auto px-6 pt-12 pb-16">
+          <div className="type-display-md">Average recovery time by drawdown depth</div>
+          <p className="type-body text-ink-muted-80 mt-3 max-w-[70ch] text-pretty">
+            Drawdowns are grouped into 5-point bands by depth. Each bar is the average number of days a drawdown in
+            that band took to climb from its trough back to the prior peak. Drawdowns that haven&apos;t recovered
+            yet are left out of the average.
+          </p>
+          <div className="mt-8">
+            {anyEpisodes ? (
+              <RecoveryChart groups={items.map((it) => ({ ticker: it.ticker, color: it.color, buckets: it.analysis.buckets }))} />
+            ) : (
+              <p className="type-body text-ink-muted-48">No drawdowns to show.</p>
+            )}
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function Swatch({ color }: { color: string }) {
+  return <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0" style={{ background: color }} />;
+}
+
+function TickerHeader({ item, compare }: { item: Prepared; compare: boolean }) {
+  const { ticker, info, series, quote } = item;
+  const q = quote.status === "ready" ? quote.data : null;
+  const change = q && q.prev != null ? q.last - q.prev : null;
+  const changePct = change != null && q?.prev ? (change / q.prev) * 100 : null;
+  const up = change != null && change >= 0;
+
+  return (
+    <div className={compare ? "" : "flex items-end gap-8 flex-wrap"}>
+      <div className="flex items-center gap-4 flex-1 min-w-[280px]">
+        <TickerLogo ticker={ticker} size={56} fontSize={14} />
+        <div className="min-w-0">
+          <div className="type-display-md text-[28px]! leading-tight truncate">{info.name}</div>
+          <div className="type-caption text-ink-muted-48 mt-1.5 flex items-center gap-1.5">
+            {compare && <Swatch color={item.color} />}
+            <span className="type-caption-strong text-ink">{ticker}</span>
+            {info.exchange && <> &middot; {info.exchange}</>} &middot; {series.length.toLocaleString("en-US")} daily closes
+          </div>
+        </div>
+      </div>
+
+      <div className={compare ? "mt-6" : "ml-auto"}>
+        {quote.status === "loading" ? (
+          <div className="type-caption text-ink-muted-48">Loading live price…</div>
+        ) : !q ? (
+          <div className="type-caption text-ink-muted-80">Couldn&apos;t load the current price.</div>
+        ) : (
+          <>
+            <div className="flex items-baseline gap-3 flex-wrap">
+              <span className="type-display-md text-[34px]! leading-tight tabular-nums">{fmtPrice(q.last)}</span>
+              <span className="type-caption text-ink-muted-48">{q.currency}</span>
+              {change != null && (
+                <span className="type-body-strong tabular-nums" style={{ color: up ? POS : NEG }}>
+                  {up ? "▲" : "▼"} {fmtNum(Math.abs(change), 2)} ({fmtPct(changePct, true)})
+                </span>
+              )}
+            </div>
+            <div className="flex gap-x-6 gap-y-2 flex-wrap mt-3">
+              {[
+                { k: "PER", v: fmtNum(q.trailingPE, 2) },
+                { k: "Fwd PER", v: fmtNum(q.forwardPE, 2) },
+                { k: "EPS", v: fmtNum(q.eps, 2) },
+                { k: "Dividend yield", v: q.dividendYield == null ? "—" : q.dividendYield.toFixed(2) + "%" },
+              ].map((f) => (
+                <div key={f.k}>
+                  <div className="type-caption text-ink-muted-48">{f.k}</div>
+                  <div className="type-body-strong tabular-nums">{f.v}</div>
+                </div>
+              ))}
+            </div>
+            <div className="type-micro-legal text-ink-muted-48 mt-3">Live price · refreshed at most once a minute</div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function StatCards({ item, compare }: { item: Prepared; compare: boolean }) {
+  const { series, analysis, quote } = item;
+  const { mdd } = analysis;
+  const last = series.length - 1;
+  const live = quote.status === "ready" ? quote.data.last : null;
+  const cur = currentDrawdown(series, mdd.runningMax, live);
+  const recovered = mdd.recoveryIdx != null;
+
+  const cards: { label: string; value: string; sub: string; color?: string; badge?: { text: string; ok: boolean } }[] = [
+    { label: "Maximum drawdown (MDD)", value: fmtPct(mdd.mdd), sub: "Largest decline from a prior peak", color: NEG },
+    {
+      label: "Current drawdown",
+      value: cur.atHigh ? "0.00%" : fmtPct(cur.value),
+      sub: `${cur.basis} · ${cur.atHigh ? "at or near the range high" : "below the range high"}`,
+      color: cur.atHigh ? POS : NEG,
+    },
+    { label: "Peak", value: fmtDate(series[mdd.peakIdx].ms), sub: fmtPrice(mdd.peakVal) },
+    { label: "Trough", value: fmtDate(series[mdd.troughIdx].ms), sub: fmtPrice(series[mdd.troughIdx].p) },
+    { label: "Decline length", value: fmtDays(daysBetween(series, mdd.peakIdx, mdd.troughIdx)), sub: "Peak → trough" },
+    recovered
+      ? {
+          label: "Recovery",
+          badge: { text: "Recovered", ok: true },
+          value: fmtDate(series[mdd.recoveryIdx as number].ms),
+          sub: `${fmtDays(daysBetween(series, mdd.troughIdx, mdd.recoveryIdx as number))} to regain the prior peak`,
+        }
+      : {
+          label: "Recovery",
+          badge: { text: "Not recovered", ok: false },
+          value: "Ongoing",
+          sub: `${fmtDays(daysBetween(series, mdd.troughIdx, last))} since the trough, still below the peak`,
+        },
+    {
+      label: "Analysis period",
+      value: `${fmtYm(series[0].ms)} – ${fmtYm(series[last].ms)}`,
+      sub: `${series.length.toLocaleString("en-US")} trading days`,
+    },
+  ];
+
+  return (
+    <div className="bg-canvas border border-hairline rounded-lg p-6">
+      {compare && (
+        <div className="flex items-center gap-2 type-tagline mb-5">
+          <Swatch color={item.color} />
+          {item.ticker}
+        </div>
+      )}
+      <div
+        className="grid gap-8 gap-x-10"
+        style={{ gridTemplateColumns: `repeat(auto-fit,minmax(${compare ? 160 : 200}px,1fr))` }}
+      >
+        {cards.map((c, i) => (
+          <div key={c.label}>
+            <div className="type-caption text-ink-muted-48 flex items-center gap-2">
+              {c.label}
+              {c.badge && (
+                <span
+                  className="inline-block px-2.5 py-0.5 rounded-pill type-fine-print font-semibold"
+                  style={{
+                    background: c.badge.ok ? "var(--color-positive-soft)" : "var(--color-negative-soft)",
+                    color: c.badge.ok ? POS : NEG,
+                  }}
+                >
+                  {c.badge.text}
+                </span>
+              )}
+            </div>
+            <div
+              className={`${i === 0 && !compare ? "type-hero-display" : compare ? "type-lead text-[24px]! whitespace-nowrap" : "type-lead text-[28px]!"} mt-1.5 tabular-nums`}
+              style={c.color ? { color: c.color } : undefined}
+            >
+              {c.value}
+            </div>
+            <div className="type-caption text-ink-muted-48 mt-2">{c.sub}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function EpisodesTable({ item, compare }: { item: Prepared; compare: boolean }) {
+  const { series, analysis } = item;
+  const top = analysis.episodes.slice(0, 5);
+  // Two tables side by side only just fit eight columns, so compare mode
+  // tightens the gutters rather than hiding the Status column off-scroll.
+  const px = compare ? "px-2" : "px-3";
+  const th = "py-3 type-caption-strong text-ink-muted-48 border-b border-hairline whitespace-nowrap";
+  const td = "py-3.5 type-caption border-b border-divider-soft whitespace-nowrap";
+
+  return (
+    <div className="bg-canvas border border-hairline rounded-lg overflow-hidden">
+      <div className="px-6 py-5 border-b border-hairline flex items-center gap-2.5 flex-wrap">
+        {compare && <Swatch color={item.color} />}
+        <span className="type-tagline">
+          {compare ? `${item.ticker} · ` : ""}Largest drawdowns
+        </span>
+        <span className="type-caption text-ink-muted-48 ml-auto">Top {compare ? 5 : top.length} by depth</span>
+      </div>
+      {top.length === 0 ? (
+        <p className="px-6 py-8 type-body text-ink-muted-48">No drawdowns to show.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full border-collapse tabular-nums">
+            <thead>
+              <tr className="bg-pearl">
+                <th className={`${th} text-left pl-6 pr-2`}>#</th>
+                <th className={`${th} text-left ${px}`}>Peak</th>
+                <th className={`${th} text-left ${px}`}>Trough</th>
+                <th className={`${th} text-right ${px}`}>Depth</th>
+                <th className={`${th} text-right ${px}`}>Decline</th>
+                <th className={`${th} text-left ${px}`}>Recovered on</th>
+                <th className={`${th} text-right ${px}`}>Recovery</th>
+                <th className={`${th} text-right pl-2 pr-6`}>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {top.map((e, idx) => {
+                const rec = e.recoveryIdx != null;
+                const first = idx === 0;
+                return (
+                  <tr key={e.peakIdx} className={first ? "bg-pearl" : ""}>
+                    <td className={`${td} pl-6 pr-2 ${first ? "font-semibold" : "text-ink-muted-48"}`}>{idx + 1}</td>
+                    <td className={`${td} ${px} ${first ? "font-semibold" : ""}`}>{fmtDate(series[e.peakIdx].ms)}</td>
+                    <td className={`${td} ${px} ${first ? "font-semibold" : "text-ink-muted-80"}`}>{fmtDate(series[e.troughIdx].ms)}</td>
+                    <td className={`${td} ${px} text-right font-semibold`} style={{ color: NEG }}>{fmtPct(e.depth)}</td>
+                    <td className={`${td} ${px} text-right text-ink-muted-80`}>{fmtDays(daysBetween(series, e.peakIdx, e.troughIdx))}</td>
+                    <td className={`${td} ${px} text-ink-muted-80`}>{rec ? fmtDate(series[e.recoveryIdx as number].ms) : "—"}</td>
+                    <td className={`${td} ${px} text-right text-ink-muted-80`}>
+                      {rec ? fmtDays(daysBetween(series, e.troughIdx, e.recoveryIdx as number)) : "—"}
+                    </td>
+                    <td className={`${td} pl-2 pr-6 text-right`}>
+                      <span
+                        className="inline-block px-2.5 py-0.5 rounded-pill type-fine-print font-semibold"
+                        style={{ background: rec ? "var(--color-positive-soft)" : "var(--color-negative-soft)", color: rec ? POS : NEG }}
+                      >
+                        {rec ? "Recovered" : "Ongoing"}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
   );
 }
