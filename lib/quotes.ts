@@ -11,25 +11,40 @@ export type QuoteSeries = {
   points: QuotePoint[];
 };
 
-export class QuoteError extends Error {}
-
-// Free plan: 800 requests/day, 8/minute, up to 5000 bars per request
-// (~20 years of daily closes). No start/end filtering needed here — the
-// app fetches once per ticker and slices ranges client-side.
-const OUTPUT_SIZE = 5000;
-
-type TwelveDataValue = { datetime: string; close: string };
-type TwelveDataResponse = {
-  meta?: { symbol: string; exchange: string; currency: string; type: string };
-  values?: TwelveDataValue[];
-  status?: string;
-  code?: number;
-  message?: string;
+export type LiveQuote = {
+  ticker: string;
+  last: number;
+  prev: number | null;
+  currency: string;
+  trailingPE: number | null;
+  forwardPE: number | null;
+  eps: number | null;
+  dividendYield: number | null; // already in percent, e.g. 0.32 means 0.32%
 };
 
-// Daily closes only change once a day, so there's no reason to spend the
-// free tier's 8 req/min budget re-fetching the same ticker on every page
-// view. Two layers sit in front of Twelve Data:
+export class QuoteError extends Error {
+  constructor(message: string, readonly kind: "not-found" | "upstream" = "upstream") {
+    super(message);
+  }
+}
+
+// Yahoo Finance has no official public API. These are the same unauthenticated
+// endpoints Yahoo's own site (and yfinance) call. There is no API key and no
+// published quota, but Yahoo does throttle with HTTP 429 when one IP sends too
+// much, so everything below sits behind caches.
+//
+// A bare "Mozilla/5.0" UA matters: Node's default UA gets through today, but a
+// full Chrome UA string gets 429'd on sight — Yahoo checks it against the TLS
+// fingerprint, and Node's doesn't look like Chrome's.
+const YAHOO = "https://query2.finance.yahoo.com";
+const UA = { "User-Agent": "Mozilla/5.0" };
+
+// The spec's earliest selectable date. History is fetched once per ticker from
+// here to today and sliced to the chosen range client-side, so the cache is one
+// row per ticker rather than one per (ticker, start, end).
+const HISTORY_START_S = Date.UTC(1980, 0, 1) / 1000;
+
+// Two layers sit in front of Yahoo's chart endpoint:
 //
 //   L1  in-process Map — free, but dies with each serverless instance
 //   L2  public.quote_series in Supabase — shared by every instance, so a
@@ -37,21 +52,26 @@ type TwelveDataResponse = {
 //
 // In-flight de-dupe collapses concurrent requests for the same ticker (e.g.
 // a watchlist rendering several rows) into a single L2 lookup and, at most,
-// a single upstream call.
-const SERIES_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+// a single upstream call. 30 minutes matches the spec; the latest bar moves
+// intraday, so this is a freshness/load trade-off rather than a daily one.
+const SERIES_CACHE_TTL_MS = 30 * 60 * 1000;
 const seriesCache = new Map<string, { data: QuoteSeries; expiresAt: number }>();
 const seriesInflight = new Map<string, Promise<QuoteSeries>>();
 
+function normalizeTicker(raw: string): string {
+  const ticker = raw.trim().toUpperCase();
+  if (!TICKER_RE.test(ticker)) {
+    throw new QuoteError(`"${raw}" doesn't look like a valid ticker.`, "not-found");
+  }
+  return ticker;
+}
+
 /**
- * Fetches daily closes from Twelve Data's time_series endpoint (free tier,
- * API key required — https://twelvedata.com/pricing). Values already
- * reflect Twelve Data's own split/dividend adjustment for equities.
+ * Daily split/dividend-adjusted closes (the spec's auto_adjust=True "Close")
+ * from Yahoo's chart endpoint, 1980 to today.
  */
 export async function fetchSeries(rawTicker: string): Promise<QuoteSeries> {
-  const ticker = rawTicker.trim().toUpperCase();
-  if (!TICKER_RE.test(ticker)) {
-    throw new QuoteError(`"${rawTicker}" doesn't look like a valid ticker.`);
-  }
+  const ticker = normalizeTicker(rawTicker);
 
   const cached = seriesCache.get(ticker);
   if (cached && cached.expiresAt > Date.now()) return cached.data;
@@ -91,10 +111,9 @@ type QuoteSeriesRow = {
 
 /**
  * Reads the shared cache, ignoring rows older than the TTL. Fails soft: a
- * Supabase outage falls through to Twelve Data rather than taking the app
- * down with it. Uses the service-role client because this module is
- * server-only and holds no user session — quote_series is world-readable
- * either way.
+ * Supabase outage falls through to Yahoo rather than taking the app down
+ * with it. Uses the service-role client because this module is server-only
+ * and holds no user session — quote_series is world-readable either way.
  */
 async function readSharedCache(ticker: string): Promise<QuoteSeries | null> {
   const freshAfter = new Date(Date.now() - SERIES_CACHE_TTL_MS).toISOString();
@@ -110,7 +129,7 @@ async function readSharedCache(ticker: string): Promise<QuoteSeries | null> {
     if (error || !data) return null;
 
     // points is jsonb, so its shape is only as good as whatever wrote it.
-    if (!Array.isArray(data.points) || data.points.length < 20) return null;
+    if (!Array.isArray(data.points) || data.points.length < 2) return null;
 
     return {
       ticker: data.ticker,
@@ -148,86 +167,216 @@ async function writeSharedCache(series: QuoteSeries): Promise<void> {
   }
 }
 
-async function fetchSeriesUncached(ticker: string): Promise<QuoteSeries> {
-  const apiKey = process.env.TWELVE_DATA_API_KEY;
-  if (!apiKey) {
-    throw new QuoteError(
-      "Server is missing TWELVE_DATA_API_KEY. Get a free key at twelvedata.com and add it to .env.local."
-    );
-  }
+type YahooChartResponse = {
+  chart?: {
+    result?: {
+      meta: {
+        currency?: string;
+        longName?: string;
+        shortName?: string;
+        fullExchangeName?: string;
+        gmtoffset?: number;
+      };
+      timestamp?: number[];
+      indicators: {
+        quote: { close: (number | null)[] }[];
+        adjclose?: { adjclose: (number | null)[] }[];
+      };
+    }[];
+    error?: { code: string; description: string } | null;
+  };
+};
 
+function rateLimitError() {
+  return new QuoteError("Yahoo Finance is rate-limiting requests right now (HTTP 429). Try again in a minute.");
+}
+
+async function fetchSeriesUncached(ticker: string): Promise<QuoteSeries> {
   const url =
-    `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(ticker)}` +
-    `&interval=1day&outputsize=${OUTPUT_SIZE}&order=ASC&apikey=${apiKey}`;
+    `${YAHOO}/v8/finance/chart/${encodeURIComponent(ticker)}` +
+    `?period1=${HISTORY_START_S}&period2=${Math.floor(Date.now() / 1000)}` +
+    `&interval=1d&events=div,split&includeAdjustedClose=true`;
 
   let res: Response;
   try {
-    res = await fetch(url, { cache: "no-store" });
+    res = await fetch(url, { headers: UA, cache: "no-store" });
   } catch {
-    throw new QuoteError("Couldn't reach the price data provider. Try again in a moment.");
+    throw new QuoteError("Couldn't reach Yahoo Finance. Try again in a moment.");
   }
 
-  if (!res.ok) {
-    throw new QuoteError(`Price data provider returned an error (${res.status}).`);
+  if (res.status === 429) throw rateLimitError();
+  if (res.status === 404) throw new QuoteError(`No data found for "${ticker}".`, "not-found");
+  if (!res.ok) throw new QuoteError(`Yahoo Finance returned an error (${res.status}).`);
+
+  const json: YahooChartResponse = await res.json();
+  const result = json.chart?.result?.[0];
+  const timestamps = result?.timestamp;
+  if (!result || !timestamps?.length) {
+    throw new QuoteError(`No data found for "${ticker}".`, "not-found");
   }
 
-  const json: TwelveDataResponse = await res.json();
+  // Adjusted close where Yahoo provides it (equities/ETFs); indices and some
+  // crypto pairs only have the raw close, which needs no adjusting anyway.
+  const closes = result.indicators.adjclose?.[0]?.adjclose ?? result.indicators.quote[0]?.close ?? [];
+  // Timestamps are the session open in UTC. Shifting by the exchange's offset
+  // before taking the date keeps e.g. a KST morning session on the right day.
+  const offsetMs = (result.meta.gmtoffset ?? 0) * 1000;
 
-  if (json.status === "error") {
-    if (json.code === 429) {
-      throw new QuoteError("Hit the price data provider's rate limit. Try again in a minute.");
-    }
-    throw new QuoteError(json.message || `No data found for "${ticker}".`);
-  }
+  // Spec §1: drop NaN closes, drop duplicate dates keeping the last, ascending.
+  const byDate = new Map<string, number>();
+  timestamps.forEach((ts, i) => {
+    const c = closes[i];
+    if (c == null || !Number.isFinite(c)) return;
+    byDate.set(new Date(ts * 1000 + offsetMs).toISOString().slice(0, 10), c);
+  });
+  const points: QuotePoint[] = [...byDate.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([t, c]) => ({ t, c }));
 
-  const values = json.values;
-  if (!values || !values.length) {
-    throw new QuoteError(`No data found for "${ticker}".`);
-  }
-
-  const points: QuotePoint[] = [];
-  let lastDate = "";
-  for (const v of values) {
-    const c = Number(v.close);
-    if (!Number.isFinite(c)) continue;
-    const date = v.datetime.slice(0, 10);
-    if (date === lastDate) continue;
-    lastDate = date;
-    points.push({ t: date, c });
-  }
-
-  if (points.length < 20) {
-    throw new QuoteError(`Not enough price history for "${ticker}" to analyze a drawdown.`);
+  if (points.length < 2) {
+    throw new QuoteError(`No data found for "${ticker}".`, "not-found");
   }
 
   return {
     ticker,
-    name: json.meta?.symbol || ticker,
-    exchange: json.meta?.exchange || "",
-    currency: json.meta?.currency || "USD",
+    name: result.meta.longName || result.meta.shortName || ticker,
+    exchange: result.meta.fullExchangeName || "",
+    currency: result.meta.currency || "USD",
     points,
   };
 }
 
-export type SymbolResult = { symbol: string; name: string; exchange: string };
+// ---------------------------------------------------------------------------
+// Live quote + fundamentals
+// ---------------------------------------------------------------------------
 
-type TwelveDataSearchRow = {
+// The quote endpoint, unlike the chart one, wants a session cookie plus a
+// matching "crumb" token. fc.yahoo.com hands out the cookie (on a 404, oddly),
+// and getcrumb exchanges it for the token. Both are reusable for hours, so one
+// pair per server instance; a 401 means it expired and is refetched once.
+let session: Promise<{ cookie: string; crumb: string }> | null = null;
+
+async function getSession() {
+  if (!session) {
+    session = (async () => {
+      const r1 = await fetch("https://fc.yahoo.com", { headers: UA, redirect: "manual", cache: "no-store" });
+      const cookie = r1.headers
+        .getSetCookie()
+        .map((c) => c.split(";")[0])
+        .join("; ");
+      if (!cookie) throw new QuoteError("Yahoo Finance didn't issue a session cookie.");
+
+      const r2 = await fetch(`${YAHOO}/v1/test/getcrumb`, { headers: { ...UA, Cookie: cookie }, cache: "no-store" });
+      if (r2.status === 429) throw rateLimitError();
+      const crumb = (await r2.text()).trim();
+      if (!r2.ok || !crumb || crumb.includes(" ")) {
+        throw new QuoteError(`Couldn't get a Yahoo Finance session (${r2.status}).`);
+      }
+      return { cookie, crumb };
+    })();
+    // A failed handshake shouldn't be cached for the life of the instance.
+    session.catch(() => (session = null));
+  }
+  return session;
+}
+
+type YahooQuoteRow = {
   symbol: string;
-  instrument_name?: string;
-  exchange?: string;
-  instrument_type?: string;
+  regularMarketPrice?: number;
+  regularMarketPreviousClose?: number;
+  currency?: string;
+  trailingPE?: number;
+  forwardPE?: number;
+  epsTrailingTwelveMonths?: number;
+  dividendYield?: number;
 };
 
+// Spec: live quote cached ~60 s per ticker.
+const QUOTE_CACHE_TTL_MS = 60 * 1000;
+const quoteCache = new Map<string, { data: LiveQuote; expiresAt: number }>();
+const quoteInflight = new Map<string, Promise<LiveQuote>>();
+
+export async function fetchQuote(rawTicker: string): Promise<LiveQuote> {
+  const ticker = normalizeTicker(rawTicker);
+
+  const cached = quoteCache.get(ticker);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+
+  const pending = quoteInflight.get(ticker);
+  if (pending) return pending;
+
+  const promise = fetchQuoteUncached(ticker)
+    .then((data) => {
+      quoteCache.set(ticker, { data, expiresAt: Date.now() + QUOTE_CACHE_TTL_MS });
+      return data;
+    })
+    .finally(() => quoteInflight.delete(ticker));
+  quoteInflight.set(ticker, promise);
+  return promise;
+}
+
+async function fetchQuoteUncached(ticker: string, retried = false): Promise<LiveQuote> {
+  const { cookie, crumb } = await getSession();
+  const url = `${YAHOO}/v7/finance/quote?symbols=${encodeURIComponent(ticker)}&crumb=${encodeURIComponent(crumb)}`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, { headers: { ...UA, Cookie: cookie }, cache: "no-store" });
+  } catch {
+    throw new QuoteError("Couldn't reach Yahoo Finance. Try again in a moment.");
+  }
+
+  if ((res.status === 401 || res.status === 403) && !retried) {
+    session = null;
+    return fetchQuoteUncached(ticker, true);
+  }
+  if (res.status === 429) throw rateLimitError();
+  if (!res.ok) throw new QuoteError(`Yahoo Finance returned an error (${res.status}).`);
+
+  const json: { quoteResponse?: { result?: YahooQuoteRow[] } } = await res.json();
+  const row = json.quoteResponse?.result?.[0];
+  if (!row || row.regularMarketPrice == null) {
+    throw new QuoteError(`No live quote for "${ticker}".`, "not-found");
+  }
+
+  const num = (v: number | undefined) => (v != null && Number.isFinite(v) ? v : null);
+  return {
+    ticker,
+    last: row.regularMarketPrice,
+    prev: num(row.regularMarketPreviousClose),
+    currency: row.currency || "USD",
+    trailingPE: num(row.trailingPE),
+    forwardPE: num(row.forwardPE),
+    eps: num(row.epsTrailingTwelveMonths),
+    dividendYield: num(row.dividendYield),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Autocomplete
+// ---------------------------------------------------------------------------
+
+export type SymbolResult = { symbol: string; name: string; exchange: string };
+
+type YahooSearchRow = {
+  symbol?: string;
+  shortname?: string;
+  longname?: string;
+  exchDisp?: string;
+  quoteType?: string;
+};
+
+const SEARCHABLE_TYPES = new Set(["EQUITY", "ETF", "INDEX", "CRYPTOCURRENCY", "MUTUALFUND"]);
+
 // Ticker/company-name mappings barely change, so cache aggressively — this
-// endpoint is fired on every autocomplete keystroke (debounced client-side)
-// and shares the same 8 req/min budget as fetchSeries.
+// endpoint is fired on every autocomplete keystroke (debounced client-side).
 const SEARCH_CACHE_TTL_MS = 60 * 60 * 1000;
 const searchCache = new Map<string, { data: SymbolResult[]; expiresAt: number }>();
 
 /**
- * Autocomplete lookup via Twelve Data's symbol_search endpoint. Fails soft
- * (returns []) rather than throwing — a broken autocomplete dropdown
- * shouldn't block the user from typing a ticker directly and submitting.
+ * Autocomplete lookup via Yahoo's search endpoint. Fails soft (returns [])
+ * rather than throwing — a broken autocomplete dropdown shouldn't block the
+ * user from typing a ticker directly and submitting.
  */
 export async function searchSymbols(rawQuery: string): Promise<SymbolResult[]> {
   const query = rawQuery.trim();
@@ -237,29 +386,28 @@ export async function searchSymbols(rawQuery: string): Promise<SymbolResult[]> {
   const cached = searchCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.data;
 
-  const apiKey = process.env.TWELVE_DATA_API_KEY;
-  if (!apiKey) return [];
-
-  const url = `https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(query)}&apikey=${apiKey}`;
+  const url =
+    `${YAHOO}/v1/finance/search?q=${encodeURIComponent(query)}` +
+    `&quotesCount=10&newsCount=0&listsCount=0`;
 
   let res: Response;
   try {
-    res = await fetch(url, { cache: "no-store" });
+    res = await fetch(url, { headers: UA, cache: "no-store" });
   } catch {
     return [];
   }
   if (!res.ok) return [];
 
-  const json: { data?: TwelveDataSearchRow[] } = await res.json().catch(() => ({}));
-  const rows = Array.isArray(json.data) ? json.data : [];
+  const json: { quotes?: YahooSearchRow[] } = await res.json().catch(() => ({}));
+  const rows = Array.isArray(json.quotes) ? json.quotes : [];
 
   const results: SymbolResult[] = rows
-    .filter((r) => !r.instrument_type || r.instrument_type === "Common Stock" || r.instrument_type === "ETF")
+    .filter((r) => r.symbol && (!r.quoteType || SEARCHABLE_TYPES.has(r.quoteType)))
     .slice(0, 8)
     .map((r) => ({
-      symbol: r.symbol,
-      name: r.instrument_name || r.symbol,
-      exchange: r.exchange || "",
+      symbol: r.symbol as string,
+      name: r.longname || r.shortname || (r.symbol as string),
+      exchange: r.exchDisp || "",
     }));
 
   searchCache.set(key, { data: results, expiresAt: Date.now() + SEARCH_CACHE_TTL_MS });

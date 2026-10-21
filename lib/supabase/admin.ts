@@ -15,9 +15,9 @@ import { createClient } from "@supabase/supabase-js";
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const secretKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Fail at startup rather than per-request. Cache reads fall back to Twelve
-// Data on error, so a missing env var would otherwise look exactly like
-// everything working — until the rate limit runs out days later.
+// Fail at startup rather than per-request. Cache reads fall back to Yahoo
+// on error, so a missing env var would otherwise look exactly like
+// everything working — until Yahoo starts answering with 429s.
 if (!url || !secretKey) {
   throw new Error(
     "Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. " +

@@ -1,5 +1,10 @@
-export const TICKER_RE = /^[A-Z0-9.\-^]{1,12}$/;
+// Yahoo conventions: AAPL, 005930.KS, BTC-USD, ^GSPC, GC=F.
+export const TICKER_RE = /^[A-Z0-9.\-^=]{1,15}$/;
+
+export function normalizeTicker(raw: string): string {
+  return raw.trim().toUpperCase();
+}
 
 export function isValidTicker(raw: string): boolean {
-  return TICKER_RE.test(raw.trim().toUpperCase());
+  return TICKER_RE.test(normalizeTicker(raw));
 }

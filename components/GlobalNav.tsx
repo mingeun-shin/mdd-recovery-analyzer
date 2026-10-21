@@ -16,7 +16,7 @@ export function GlobalNav() {
         {/* Attribution is the first thing worth dropping on a phone, where
             the two links need the width more. */}
         <div className="ml-auto items-center gap-4 opacity-85 type-nav-link hidden sm:flex">
-          <span>Data via Twelve Data</span>
+          <span>Data via Yahoo Finance</span>
         </div>
       </div>
     </nav>
