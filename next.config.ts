@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // The desktop build (scripts/build-desktop.mjs) needs a self-contained
+  // server.js. The web build keeps the default so `next start` still works.
+  output: process.env.NEXT_STANDALONE === "1" ? "standalone" : undefined,
   images: {
     remotePatterns: [
       {

@@ -52,6 +52,31 @@ Then open <http://localhost:3000>.
 | `npm run typecheck` | TypeScript, no emit |
 | `npm run lint` | ESLint |
 | `npm run build && npm start` | Production build and server |
+| `npm run desktop` | Build and open the desktop app from source |
+| `npm run desktop:dist` | Package the desktop app into an installer |
+
+## Desktop app
+
+The same app also runs as a double-click desktop app, with no terminal
+window. It's an [Electron](https://www.electronjs.org/) shell that starts the
+Next.js server as a hidden background process, opens it in its own window,
+and shuts the server down when you quit.
+
+```bash
+npm install
+npm run desktop:dist
+```
+
+The installer lands in `dist-desktop/`: a `.dmg` on macOS, an `.exe` setup
+on Windows, an `.AppImage` on Linux. Build on the platform you want to run
+it on. On a Mac, open the `.dmg` and drag **Drawdown Analyzer** into
+Applications.
+
+The app isn't signed with a paid Apple or Microsoft developer certificate.
+One you build yourself opens normally. A copy downloaded from someone else
+gets blocked the first time: on macOS, go to System Settings → Privacy &
+Security and click **Open Anyway**; on Windows, click **More info → Run
+anyway** in the SmartScreen prompt.
 
 ## How it works
 
@@ -132,12 +157,13 @@ lib/
 scripts/
   spec_reference.py   Python reference implementation and fixture generator
 public/sw.js      service worker
+electron/main.mjs desktop shell: starts the server, opens the window
 ```
 
 ## Tech stack
 
-Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS 4 · Vitest ·
-GitHub Actions
+Next.js 16 (App Router) · React 19 · TypeScript · Tailwind CSS 4 · Electron ·
+Vitest · GitHub Actions
 
 ## License
 

@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Packaged desktop app (npm run desktop:dist).
+    "dist-desktop/**",
   ]),
 ]);
 

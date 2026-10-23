@@ -2,6 +2,9 @@
   "name": "mddapp",
   "version": "0.1.0",
   "private": true,
+  "description": "How far did a stock fall, and how long did it take to come back?",
+  "author": "Mingeun Shin",
+  "main": "electron/main.mjs",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -9,7 +12,9 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "desktop": "node scripts/build-desktop.mjs && electron .",
+    "desktop:dist": "node scripts/build-desktop.mjs && electron-builder"
   },
   "dependencies": {
     "next": "16.2.12",
@@ -21,10 +26,41 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
     "eslint": "^9",
     "eslint-config-next": "16.2.12",
     "tailwindcss": "^4",
     "typescript": "^5",
     "vitest": "^4.1.12"
+  },
+  "build": {
+    "appId": "io.github.mingeun-shin.drawdown-analyzer",
+    "productName": "Drawdown Analyzer",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "electron/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.finance",
+      "icon": "public/icon-512.png",
+      "identity": "-",
+      "hardenedRuntime": false
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "public/icon-512.png"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Finance",
+      "icon": "public/icon-512.png"
+    },
+    "afterPack": "scripts/after-pack.mjs"
   }
 }

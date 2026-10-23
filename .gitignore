@@ -44,3 +44,6 @@ next-env.d.ts
 # claude code (AGENTS.md stays tracked — it holds the actual project rules)
 CLAUDE.md
 .claude/
+
+# desktop app build output
+/dist-desktop
