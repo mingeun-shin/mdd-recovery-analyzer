@@ -62,6 +62,11 @@ window. It's an [Electron](https://www.electronjs.org/) shell that starts the
 Next.js server as a hidden background process, opens it in its own window,
 and shuts the server down when you quit.
 
+**Download:** the macOS (Apple Silicon) installer is on the
+[Releases page](https://github.com/mingeun-shin/mdd-recovery-analyzer/releases/latest).
+
+**Or build it yourself**, on any platform:
+
 ```bash
 npm install
 npm run desktop:dist
