@@ -1,5 +1,5 @@
 {
-  "name": "mddapp",
+  "name": "drawdown-analyzer",
   "version": "0.1.0",
   "private": true,
   "description": "How far did a stock fall, and how long did it take to come back?",
@@ -61,6 +61,7 @@
       "category": "Finance",
       "icon": "public/icon-512.png"
     },
-    "afterPack": "scripts/after-pack.mjs"
+    "afterPack": "scripts/after-pack.mjs",
+    "artifactName": "Drawdown-Analyzer-${version}-${arch}.${ext}"
   }
 }
